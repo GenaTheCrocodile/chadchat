@@ -29,4 +29,4 @@ Server commands:
 ```
 
 ## License
-[MIT](https://opensource.org/licenses/MIT)
+[GNU GPLv3](https://choosealicense.com/licenses/gpl-3.0/)
