@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+
+import asyncio
+from argparse import ArgumentParser
+from threading import Thread
+from readline import get_line_buffer
+from colorama import Fore
+from colorama import Style
+from colorama.ansi import clear_line
+
+clients = set()
+banned = set()
+
+INPUT_PROMPT = '~> '
+HELP_TEXT = '''Server commands:
+  help                          - display this text
+  shutdown                      - shutdown the server
+  online                        - list users that are online
+  banned                        - list users that are banned
+  kick  <user1> <user2> <userN> - kick N users
+  ban   <user1> <user2> <userN> - ban N users
+  unban <user1> <user2> <userN> - unban N users
+'''
+
+
+class User:
+
+    def __init__(self, username, reader, writer):
+        self.name = username
+        self.reader = reader
+        self.writer = writer
+        self.ip = writer.get_extra_info('peername')[0]
+
+
+def iprint(text, end='', flush=False, prompt=False):
+    '''Print something without overwriting console input.
+
+    Set prompt to True if you want to print outside of the
+    console function.'''
+    PROMPT = ''
+    old_input = get_line_buffer()
+    if prompt:
+        PROMPT = INPUT_PROMPT
+
+    print(f'\r{clear_line()}{text}\n{PROMPT}{old_input}', end=end, flush=flush)
+
+
+def error(text, end='', flush=False, prompt=False):
+    '''iprint but with red text.'''
+    iprint(f'{Fore.RED}ERROR: {text}{Style.RESET_ALL}', end=end, flush=flush, prompt=prompt)
+
+
+def info(text, end='', flush=False, prompt=False):
+    '''iprint but with yellow text.'''
+    iprint(f'{Fore.YELLOW}INFO: {text}{Style.RESET_ALL}', end=end, flush=flush, prompt=prompt)
+
+
+def success(text, end='', flush=False, prompt=False):
+    '''iprint but with green text.'''
+    iprint(f'{Fore.GREEN}SUCCESS: {text}{Style.RESET_ALL}', end=end, flush=flush, prompt=prompt)
+
+
+def print_users(collection):
+
+    names = set()
+    for client in collection:
+        names.add(client.name)
+
+    if names:
+        iprint(', '.join(names))
+
+
+def unique_name(name):
+
+    for client in clients:
+        if client.name == name:
+            return False
+
+    return True
+
+
+def is_banned(ip):
+
+    for client in banned:
+        if client.ip == ip:
+            return True
+
+    return False
+
+
+def unique_ip(ip):
+
+    for client in clients:
+        if client.ip == ip:
+            return False
+
+    return True
+
+
+async def user_connected(name):
+
+    # \n for compatibility with clients like netcat, telnet, etc...
+    user_online = f'{Fore.GREEN}{name} is online{Style.RESET_ALL}\n'
+
+    await send_to_everyone(user_online)
+    iprint(user_online[:-1], prompt=True)
+
+
+async def user_disconnected(name):
+
+    await send_to_everyone(f'{Fore.RED}{name} is offline{Style.RESET_ALL}\n')
+
+
+async def send_to_everyone(msg):
+
+    msg = msg.encode('utf-8')
+
+    for client in clients:
+        if not client.writer.is_closing():
+            client.writer.write(msg)
+            await client.writer.drain()
+
+
+async def handle_client(reader, writer):
+
+    try:
+        writer.write('Name: '.encode('utf-8'))
+        await writer.drain()
+        username = await reader.read(128)
+        username = username.decode('utf-8').strip()
+
+        user = User(username, reader, writer)
+
+        if not username or len(username) > 30:
+            writer.write(f'{Fore.RED}ERROR: Invalid name{Style.RESET_ALL}\n'.encode('utf-8'))
+            await writer.drain()
+            raise ConnectionResetError('User has entered an invalid name and left')
+
+        elif not unique_name(username):
+            writer.write(f'{Fore.RED}ERROR: Name is already taken{Style.RESET_ALL}\n'.encode('utf-8'))
+            await writer.drain()
+            raise ConnectionResetError(f'We can\'t handle one more `{username}` on this server!')
+
+        elif is_banned(user.ip):
+            writer.write(f'{Fore.RED}ERROR: Access denied{Style.RESET_ALL}\n'.encode('utf-8'))
+            await writer.drain()
+            raise ConnectionResetError(f'`{username}` is banned')
+
+        elif not unique_ip(user.ip):
+            writer.write(f'{Fore.RED}ERROR: User already online{Style.RESET_ALL}\n'.encode('utf-8'))
+            await writer.drain()
+            raise ConnectionResetError(f'`{username}` tried to join his/her/its/le imaginary friends')
+
+        clients.add(user)
+
+        await user_connected(username)
+
+        while True:
+            data = await reader.read(4096)
+            if not data:
+                raise ConnectionResetError(f'`{username}` has been disconnected from the server')
+
+            data = f'[{user.name}]: '.encode('utf-8') + data
+            for client in clients:
+                if not client.writer.is_closing():
+                    if client.writer == writer:
+                        client.writer.write('\033[A'.encode('utf-8') + data)
+
+                    else:
+                        client.writer.write(data)
+
+                    await client.writer.drain()
+
+    except ConnectionResetError as e:
+        info(e, prompt=True)
+
+    except Exception as e:
+        error(repr(e), prompt=True)
+
+    finally:
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+
+        if user in clients:
+            clients.discard(user)
+            await user_disconnected(username)
+
+
+def console(server):
+
+    loop = server.get_loop()
+
+    while True:
+        command = input(INPUT_PROMPT).strip().split()
+        if not command:
+            continue
+
+        elif command[0] == 'help':
+            print(HELP_TEXT)
+
+        elif command[0] == 'shutdown':
+            for client in clients:
+                client.writer.close()
+                asyncio.run_coroutine_threadsafe(client.writer.wait_closed(), loop)
+
+            server.close()
+            asyncio.run_coroutine_threadsafe(server.wait_closed(), loop)
+            break
+
+        elif command[0] == 'kick' or command[0] == 'ban':
+            if len(command) < 2:
+                error('No users were specified')
+                continue
+
+            for target in command[1:]:
+                for client in clients:
+                    if client.name == target:
+                        if command[0] == 'ban':
+                            banned.add(client)
+                            client.writer.write('SERVER: You were banned from the server\n'.encode('utf-8'))
+                            asyncio.run_coroutine_threadsafe(client.writer.drain(), loop)
+                            success(f'`{target}` was banned')
+
+                        else:
+                            client.writer.write('SERVER: You were kicked from the server\n'.encode('utf-8'))
+                            asyncio.run_coroutine_threadsafe(client.writer.drain(), loop)
+                            success(f'`{target}` was kicked')
+
+                        client.writer.close()
+                        asyncio.run_coroutine_threadsafe(client.writer.wait_closed(), loop)
+                        break
+
+                else:
+                    error(f'`{target}` was not found. Skipping...')
+
+        elif command[0] == 'unban':
+            if len(command) < 2:
+                error('No users were specified')
+                continue
+
+            for target in command[1:]:
+                for client in banned:
+                    if client.name == target:
+                        banned.discard(client)
+                        success(f'`{target}` was unbanned')
+                        break
+                else:
+                    error(f'`{target}` was not found. Skipping...')
+
+        elif command[0] == 'online':
+            print_users(clients)
+
+        elif command[0] == 'banned':
+            print_users(banned)
+
+
+async def main(IP, PORT):
+
+    server = await asyncio.start_server(
+        handle_client, IP, PORT)
+
+    console_thread = Thread(target=console, args=(server,))
+    console_thread.daemon = True
+    console_thread.start()
+
+    async with server:
+        try:
+            await server.serve_forever()
+        except asyncio.exceptions.CancelledError:
+            info('The Server was closed')
+
+
+if __name__ == '__main__':
+    parser = ArgumentParser(description='Simple chat server for chads.')
+    parser.add_argument('ip', help='server ip')
+    parser.add_argument('port', type=int, help='server port')
+    args = parser.parse_args()
+
+    asyncio.run(main(args.ip, args.port))
