@@ -2,7 +2,7 @@
 A little asynchronous chatroom server that is compatible with clients like netcat
 
 ## Usage
-```
+```console
 usage: chadserv [-h] ip port
 
 Simple chat server for chads.
@@ -17,7 +17,7 @@ options:
 ```
 
 ## Server commands
-```
+```console
 Server commands:
   help                          - display this text
   shutdown                      - shutdown the server
